@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -21,8 +22,12 @@ import (
 	"github.com/charmbracelet/crush/internal/home"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
+	"github.com/charmbracelet/crush/internal/state"
 	"github.com/charmbracelet/crush/internal/version"
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
+	"golang.org/x/oauth2"
 )
 
 func parseLevel(level mcp.LoggingLevel) slog.Level {
@@ -53,11 +58,19 @@ func (s *ClientSession) Close() error {
 }
 
 var (
-	sessions = csync.NewMap[string, *ClientSession]()
-	states   = csync.NewMap[string, ClientInfo]()
-	broker   = pubsub.NewBroker[Event]()
-	initOnce sync.Once
-	initDone = make(chan struct{})
+	sessions    = csync.NewMap[string, *mcp.ClientSession]()
+	states      = csync.NewMap[string, ClientInfo]()
+	broker      = pubsub.NewBroker[Event]()
+	authCancels = csync.NewMap[string, context.CancelFunc]()
+	initOnce    sync.Once
+	initDone    = make(chan struct{})
+
+	// oauthCallbackPorts defines the local TCP ports to try binding to for the
+	// OAuth2 callback server for the authorization code flow.
+	oauthCallbackPorts = []int{49433, 52829, 54257}
+	// oauthClientMetadataURL defines the URL required by
+	// https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-01
+	oauthClientMetadataURL = "https://charm.land/oauth/client-metadata.json"
 )
 
 // State represents the current state of an MCP client
@@ -93,6 +106,15 @@ const (
 	EventToolsListChanged
 	EventPromptsListChanged
 	EventResourcesListChanged
+	// EventAuthRequired is published when an HTTP/SSE MCP server responds with
+	// 401 Unauthorized and the client must complete an OAuth2 authorization
+	// flow before retrying.
+	EventAuthRequired
+	// EventAuthCompleted is published when an OAuth2 authorization flow
+	// completes successfully.
+	EventAuthCompleted
+	// EventAuthFailed is published when an OAuth2 authorization flow fails.
+	EventAuthFailed
 )
 
 // Event represents an event in the MCP system
@@ -102,6 +124,9 @@ type Event struct {
 	State  State
 	Error  error
 	Counts Counts
+	// AuthURL is the OAuth2 authorization URL that needs to be opened in a
+	// browser. Populated only for EventAuthRequired events.
+	AuthURL string
 }
 
 // Counts number of available tools, prompts, etc.
@@ -124,6 +149,15 @@ type ClientInfo struct {
 // SubscribeEvents returns a channel for MCP events
 func SubscribeEvents(ctx context.Context) <-chan pubsub.Event[Event] {
 	return broker.Subscribe(ctx)
+}
+
+// CancelAuth cancels a pending OAuth2 authorization flow.
+func CancelAuth(name string) {
+	cancel, ok := authCancels.Get(name)
+	if !ok {
+		return
+	}
+	cancel()
 }
 
 // GetStates returns the current state of all MCP clients
@@ -353,7 +387,7 @@ func createSession(ctx context.Context, name string, m config.MCPConfig, resolve
 	mcpCtx, cancel := context.WithCancel(ctx)
 	cancelTimer := time.AfterFunc(timeout, cancel)
 
-	transport, err := createTransport(mcpCtx, m, resolver)
+	transport, err := createTransport(mcpCtx, name, m, resolver)
 	if err != nil {
 		updateState(name, StateError, err, nil, Counts{})
 		slog.Error("Error creating MCP client", "error", err, "name", name)
@@ -437,7 +471,7 @@ func maybeTimeoutErr(err error, timeout time.Duration) error {
 	return err
 }
 
-func createTransport(ctx context.Context, m config.MCPConfig, resolver config.VariableResolver) (mcp.Transport, error) {
+func createTransport(ctx context.Context, name string, m config.MCPConfig, resolver config.VariableResolver) (mcp.Transport, error) {
 	switch m.Type {
 	case config.MCPStdio:
 		command, err := resolver.ResolveValue(m.Command)
@@ -453,26 +487,27 @@ func createTransport(ctx context.Context, m config.MCPConfig, resolver config.Va
 			Command: cmd,
 		}, nil
 	case config.MCPHttp:
+		store, err := state.NewMCPStore(name)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't init MCP state store: %v", err)
+		}
 		if strings.TrimSpace(m.URL) == "" {
 			return nil, fmt.Errorf("mcp http config requires a non-empty 'url' field")
 		}
 		client := &http.Client{
-			Transport: &headerRoundTripper{
-				headers: m.ResolvedHeaders(),
-			},
+			Transport: &headerRoundTripper{headers: m.ResolvedHeaders()},
 		}
 		return &mcp.StreamableClientTransport{
-			Endpoint:   m.URL,
-			HTTPClient: client,
+			Endpoint:     m.URL,
+			HTTPClient:   client,
+			OAuthHandler: &crushOAuthHandler{store: store, name: name, mcpURL: m.URL},
 		}, nil
 	case config.MCPSSE:
 		if strings.TrimSpace(m.URL) == "" {
 			return nil, fmt.Errorf("mcp sse config requires a non-empty 'url' field")
 		}
 		client := &http.Client{
-			Transport: &headerRoundTripper{
-				headers: m.ResolvedHeaders(),
-			},
+			Transport: &headerRoundTripper{headers: m.ResolvedHeaders()},
 		}
 		return &mcp.SSEClientTransport{
 			Endpoint:   m.URL,
@@ -492,6 +527,235 @@ func (rt headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		req.Header.Set(k, v)
 	}
 	return http.DefaultTransport.RoundTrip(req)
+}
+
+type crushOAuthHandler struct {
+	store  *state.MCPStore
+	name   string
+	mcpURL string
+
+	// retry loop detection
+	mu           sync.Mutex
+	authAttempts int
+	lastAuth     time.Time
+}
+
+// tokenSourceFunc implements an oauth2.TokenSource adapter pattern.
+type tokenSourceFunc func() (*oauth2.Token, error)
+
+func (f tokenSourceFunc) Token() (*oauth2.Token, error) {
+	return f()
+}
+
+// TokenSource will save tokens to the MCPOAuth2Store on each refresh.
+func (h *crushOAuthHandler) TokenSource(ctx context.Context) (oauth2.TokenSource, error) {
+	st, err := h.store.Load()
+	if errors.Is(err, state.ErrNoStore) {
+		return nil, nil // no error, just no token available
+	}
+	if err != nil {
+		return nil, fmt.Errorf("couldn't load MCP OAuth2 state: %v", err)
+	}
+
+	if st.Config != nil {
+		base := st.Config.TokenSource(ctx, st.Token)
+		return tokenSourceFunc(func() (*oauth2.Token, error) {
+			tok, err := base.Token()
+			if err != nil {
+				return nil, err
+			}
+			if st.Token == nil || tok.AccessToken != st.Token.AccessToken || tok.RefreshToken != st.Token.RefreshToken {
+				st.Token = tok
+				if err := h.store.SaveOAuth2Token(tok); err != nil {
+					slog.Warn("Failed to save MCP OAuth2 state", "name", h.name, "error", err)
+				}
+			}
+			return tok, nil
+		}), nil
+	}
+
+	return oauth2.StaticTokenSource(st.Token), nil
+}
+
+func (h *crushOAuthHandler) Authorize(ctx context.Context, req *http.Request, resp *http.Response) error {
+	authCtx, authCancel := context.WithCancel(ctx)
+	defer authCancel()
+	authCancels.Set(h.name, authCancel)
+	defer authCancels.Del(h.name)
+
+	// check for retry loop
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now()
+	if now.Sub(h.lastAuth) > time.Minute {
+		h.authAttempts = 0
+	}
+	h.authAttempts++
+	h.lastAuth = now
+	if h.authAttempts > 3 {
+		return fmt.Errorf("authorization retry limit exceeded: potential infinite scope step-up loop detected")
+	}
+	// load existing state, if possible
+	st, err := h.store.Load()
+	if err != nil {
+		if err != state.ErrNoStore {
+			return fmt.Errorf("couldn't load oauth2 state: %v", err)
+		}
+		st = &state.MCPOAuth2{}
+	}
+	// force token refresh to return early and avoid interactive flow if possible
+	if st.Config != nil && st.Token != nil && st.Token.RefreshToken != "" {
+		st.Token.Expiry = time.Now().Add(-time.Hour)
+		ts := st.Config.TokenSource(ctx, st.Token)
+		tok, err := ts.Token()
+		if err == nil && tok.Valid() {
+			if err := h.store.SaveOAuth2Token(tok); err != nil {
+				slog.Warn("Failed to save MCP OAuth2 state", "name", h.name, "error", err)
+			}
+			return nil
+		}
+	}
+	// use pre-registered client credentials if available
+	var preReg *oauthex.ClientCredentials
+	if st.Config != nil && st.Config.ClientID != "" {
+		preReg = &oauthex.ClientCredentials{
+			ClientID: st.Config.ClientID,
+		}
+		if st.Config.ClientSecret != "" {
+			preReg.ClientSecretAuth = &oauthex.ClientSecretAuth{
+				ClientSecret: st.Config.ClientSecret,
+			}
+		}
+	}
+	// create a listener on one of the valid redirect URI ports
+	var ln net.Listener
+	for _, port := range oauthCallbackPorts {
+		ln, err = (&net.ListenConfig{}).
+			Listen(authCtx, "tcp", fmt.Sprintf("localhost:%d", port))
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("couldn't create listener for oauth2 callback on any of the specified ports: %v", err)
+	}
+	defer ln.Close()
+	// construct the redirect URI
+	redirectURI := fmt.Sprintf("http://localhost:%d/callback",
+		ln.Addr().(*net.TCPAddr).Port)
+	// configure the mcp go-sdk authz code handler
+	cfg := &auth.AuthorizationCodeHandlerConfig{
+		ClientIDMetadataDocumentConfig: &auth.ClientIDMetadataDocumentConfig{
+			URL: oauthClientMetadataURL,
+		},
+		DynamicClientRegistrationConfig: &auth.DynamicClientRegistrationConfig{
+			Metadata: &oauthex.ClientRegistrationMetadata{
+				ClientName:              "Crush",
+				ClientURI:               "https://github.com/charmbracelet/crush",
+				RedirectURIs:            []string{redirectURI},
+				TokenEndpointAuthMethod: "none",
+				GrantTypes:              []string{"authorization_code"},
+				ResponseTypes:           []string{"code"},
+			},
+		},
+		PreregisteredClient: preReg,
+		RedirectURL:         redirectURI,
+		OAuth2ConfigCallback: func(cfg *oauth2.Config) {
+			if err := h.store.SaveOAuth2Config(cfg); err != nil {
+				slog.Warn("Failed to save MCP OAuth2 state", "name", h.name, "error", err)
+			}
+		},
+		AuthorizationCodeFetcher: func(ctx context.Context, args *auth.AuthorizationArgs) (*auth.AuthorizationResult, error) {
+			broker.Publish(pubsub.UpdatedEvent, Event{
+				Type:    EventAuthRequired,
+				Name:    h.name,
+				AuthURL: args.URL,
+			})
+
+			codeCh := make(chan string, 1)
+			stateCh := make(chan string, 1)
+			errCh := make(chan error, 1)
+
+			srv := &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					q := r.URL.Query()
+					stateParam := q.Get("state")
+					code := q.Get("code")
+					if code == "" {
+						desc := q.Get("error_description")
+						if desc == "" {
+							desc = q.Get("error")
+						}
+						http.Error(w, "authorization failed", http.StatusBadRequest)
+						errCh <- fmt.Errorf("authorization failed: %s", desc)
+						return
+					}
+					fmt.Fprintln(w, "Authorization successful. You may close this tab.")
+					stateCh <- stateParam
+					codeCh <- code
+				}),
+			}
+
+			go func() {
+				if srvErr := srv.Serve(ln); srvErr != nil && srvErr != http.ErrServerClosed {
+					errCh <- srvErr
+				}
+			}()
+			defer srv.Close()
+
+			select {
+			case <-ctx.Done():
+				err := ctx.Err()
+				broker.Publish(pubsub.UpdatedEvent, Event{
+					Type:  EventAuthFailed,
+					Name:  h.name,
+					Error: fmt.Errorf("authorization failed: %v", err),
+				})
+				return nil, err
+			case err := <-errCh:
+				broker.Publish(pubsub.UpdatedEvent, Event{
+					Type:  EventAuthFailed,
+					Name:  h.name,
+					Error: err,
+				})
+				return nil, err
+			case code := <-codeCh:
+				stateParam := <-stateCh
+				return &auth.AuthorizationResult{
+					Code:  code,
+					State: stateParam,
+				}, nil
+			}
+		},
+	}
+
+	// run the auth code flow
+	sdkHandler, err := auth.NewAuthorizationCodeHandler(cfg)
+	if err != nil {
+		return fmt.Errorf("couldn't create authz code handler: %v", err)
+	}
+	if err := sdkHandler.Authorize(authCtx, req, resp); err != nil {
+		return fmt.Errorf("couldn't perform authz flow: %v", err)
+	}
+	ts, err := sdkHandler.TokenSource(authCtx)
+	if err != nil {
+		return fmt.Errorf("couldn't get token source: %v", err)
+	}
+	tok, err := ts.Token()
+	if err != nil {
+		return fmt.Errorf("couldn't get token: %v", err)
+	}
+	st.Token = tok
+	if err := h.store.SaveOAuth2Token(tok); err != nil {
+		return fmt.Errorf("couldn't store token: %v", err)
+	}
+
+	broker.Publish(pubsub.UpdatedEvent, Event{
+		Type: EventAuthCompleted,
+		Name: h.name,
+	})
+
+	return nil
 }
 
 func mcpTimeout(m config.MCPConfig) time.Duration {
