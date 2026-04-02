@@ -763,6 +763,15 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, handleMCPToolsEvent(m.com.Workspace, msg.Payload.Name)
 		case mcp.EventResourcesListChanged:
 			return m, handleMCPResourcesEvent(m.com.Workspace, msg.Payload.Name)
+		case mcp.EventAuthRequired:
+			if cmd := m.openMCPAuthDialog(msg.Payload); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		case mcp.EventAuthCompleted:
+			m.dialog.CloseDialog(dialog.OAuthID)
+		case mcp.EventAuthFailed:
+			m.dialog.CloseDialog(dialog.OAuthID)
+			cmds = append(cmds, util.ReportError(msg.Payload.Error))
 		}
 	case pubsub.Event[permission.PermissionRequest]:
 		if cmd := m.openPermissionsDialog(msg.Payload); cmd != nil {
@@ -1492,6 +1501,9 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		if m.focus == uiFocusEditor {
 			cmds = append(cmds, m.textarea.Focus())
 		}
+	case dialog.ActionCancelMCPOAuth:
+		mcp.CancelAuth(msg.Name)
+		m.dialog.CloseDialog(dialog.OAuthID)
 	case dialog.ActionCmd:
 		if msg.Cmd != nil {
 			cmds = append(cmds, msg.Cmd)
@@ -1904,6 +1916,27 @@ func (m *UI) openAuthenticationDialog(provider catwalk.Provider, model config.Se
 	default:
 		dlg, cmd = dialog.NewAPIKeyInput(m.com, isOnboarding, provider, model, modelType)
 	}
+
+	if m.dialog.ContainsDialog(dlg.ID()) {
+		m.dialog.BringToFront(dlg.ID())
+		return nil
+	}
+
+	m.dialog.OpenDialog(dlg)
+	return cmd
+}
+
+func (m *UI) openMCPAuthDialog(event mcp.Event) tea.Cmd {
+	if event.AuthURL == "" {
+		slog.Warn("EventAuthRequired missing AuthURL, cannot open MCP auth dialog", "name", event.Name)
+		return nil
+	}
+
+	dlg, cmd := dialog.NewOAuthMCP(
+		m.com,
+		event.Name,
+		event.AuthURL,
+	)
 
 	if m.dialog.ContainsDialog(dlg.ID()) {
 		m.dialog.BringToFront(dlg.ID())
