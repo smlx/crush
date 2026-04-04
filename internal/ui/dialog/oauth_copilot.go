@@ -19,7 +19,7 @@ func NewOAuthCopilot(
 	model config.SelectedModel,
 	modelType config.SelectedModelType,
 ) (*OAuth, tea.Cmd) {
-	return newOAuth(com, isOnboarding, provider, model, modelType, &OAuthCopilot{})
+	return newOAuth(com, isOnboarding, provider, model, modelType, &OAuthCopilot{}, nil, nil)
 }
 
 type OAuthCopilot struct {

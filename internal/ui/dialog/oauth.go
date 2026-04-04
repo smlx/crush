@@ -1,7 +1,9 @@
 package dialog
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/util"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/pkg/browser"
+	"golang.org/x/oauth2"
 )
 
 type OAuthProvider interface {
@@ -66,7 +69,12 @@ type OAuth struct {
 	expiresIn       int
 	interval        int
 	token           *oauth.Token
+	oauth2Token     *oauth2.Token
 	cancelFunc      context.CancelFunc
+	// onComplete, when non-nil, is called instead of saveKeyAndContinue when
+	// the OAuth flow completes successfully.
+	onComplete func(*oauth2.Token) Action
+	onCancel   func() Action
 }
 
 var _ Dialog = (*OAuth)(nil)
@@ -79,6 +87,8 @@ func newOAuth(
 	model config.SelectedModel,
 	modelType config.SelectedModelType,
 	oAuthProvider OAuthProvider,
+	onComplete func(*oauth2.Token) Action,
+	onCancel func() Action,
 ) (*OAuth, tea.Cmd) {
 	t := com.Styles
 
@@ -89,7 +99,9 @@ func newOAuth(
 	m.model = model
 	m.modelType = modelType
 	m.oAuthProvider = oAuthProvider
-	m.width = 60
+	m.onComplete = onComplete
+	m.onCancel = onCancel
+	m.width = 80
 	m.State = OAuthStateInitializing
 
 	m.spinner = spinner.New(
@@ -140,7 +152,7 @@ func (m *OAuth) HandleMsg(msg tea.Msg) Action {
 		case key.Matches(msg, m.keyMap.Submit):
 			switch m.State {
 			case OAuthStateSuccess:
-				return m.saveKeyAndContinue()
+				return m.complete()
 
 			default:
 				cmd := m.copyCodeAndOpenURL()
@@ -150,10 +162,10 @@ func (m *OAuth) HandleMsg(msg tea.Msg) Action {
 		case key.Matches(msg, m.keyMap.Close):
 			switch m.State {
 			case OAuthStateSuccess:
-				return m.saveKeyAndContinue()
+				return m.complete()
 
 			default:
-				return ActionClose{}
+				return m.cancel()
 			}
 		}
 
@@ -169,6 +181,11 @@ func (m *OAuth) HandleMsg(msg tea.Msg) Action {
 	case ActionCompleteOAuth:
 		m.State = OAuthStateSuccess
 		m.token = msg.Token
+		return ActionCmd{m.oAuthProvider.stopPolling}
+
+	case ActionCompleteMCPOAuth:
+		m.State = OAuthStateSuccess
+		m.oauth2Token = msg.Token
 		return ActionCmd{m.oAuthProvider.stopPolling}
 
 	case ActionOAuthErrored:
@@ -253,27 +270,38 @@ func (m *OAuth) innerDialogContent() string {
 			)
 
 	case OAuthStateDisplay:
-		instructions := lipgloss.NewStyle().
-			Margin(0, 1).
-			Width(m.width - 2).
-			Render(
-				whiteStyle.Render("Press ") +
-					primaryStyle.Render("enter") +
-					whiteStyle.Render(" to copy the code below and open the browser."),
-			)
+		parts := []string{""}
 
-		codeBox := lipgloss.NewStyle().
-			Width(m.width-2).
-			Height(7).
-			Align(lipgloss.Center, lipgloss.Center).
-			Background(t.BgBaseLighter).
-			Margin(0, 1).
-			Render(
-				lipgloss.NewStyle().
-					Bold(true).
-					Foreground(t.White).
-					Render(m.userCode),
-			)
+		if m.userCode == "" {
+			instructions := lipgloss.NewStyle().
+				Margin(0, 1).
+				Width(m.width - 2).
+				Render(whiteStyle.Render("Press ") +
+					primaryStyle.Render("enter") +
+					whiteStyle.Render(" to copy the URL below and open it the browser."))
+			parts = append(parts, instructions, "")
+		} else {
+			instructions := lipgloss.NewStyle().
+				Margin(0, 1).
+				Width(m.width - 2).
+				Render(whiteStyle.Render("Press ") +
+					primaryStyle.Render("enter") +
+					whiteStyle.Render(" to copy the code below and open the browser."))
+
+			codeBox := lipgloss.NewStyle().
+				Width(m.width-2).
+				Height(7).
+				Align(lipgloss.Center, lipgloss.Center).
+				Background(t.BgBaseLighter).
+				Margin(0, 1).
+				Render(
+					lipgloss.NewStyle().
+						Bold(true).
+						Foreground(t.White).
+						Render(m.userCode),
+				)
+			parts = append(parts, instructions, "", codeBox, "")
+		}
 
 		link := linkStyle.Hyperlink(m.verificationURL, "id=oauth-verify").Render(m.verificationURL)
 		url := mutedStyle.
@@ -288,18 +316,9 @@ func (m *OAuth) innerDialogContent() string {
 				greenStyle.Render(m.spinner.View()) + mutedStyle.Render("Verifying..."),
 			)
 
-		return lipgloss.JoinVertical(
-			lipgloss.Left,
-			"",
-			instructions,
-			"",
-			codeBox,
-			"",
-			url,
-			"",
-			waiting,
-			"",
-		)
+		parts = append(parts, url, "", waiting, "")
+
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
 
 	case OAuthStateSuccess:
 		return greenStyle.
@@ -338,16 +357,17 @@ func (m *OAuth) ShortHelp() []key.Binding {
 		}
 
 	default:
-		return []key.Binding{
-			m.keyMap.Copy,
-			m.keyMap.Submit,
-			m.keyMap.Close,
+		bindings := []key.Binding{}
+		if m.userCode != "" {
+			bindings = append(bindings, m.keyMap.Copy)
 		}
+		bindings = append(bindings, m.keyMap.Submit, m.keyMap.Close)
+		return bindings
 	}
 }
 
 func (d *OAuth) copyCode() tea.Cmd {
-	if d.State != OAuthStateDisplay {
+	if d.State != OAuthStateDisplay || d.userCode == "" {
 		return nil
 	}
 	return tea.Sequence(
@@ -360,16 +380,48 @@ func (d *OAuth) copyCodeAndOpenURL() tea.Cmd {
 	if d.State != OAuthStateDisplay {
 		return nil
 	}
-	return tea.Sequence(
-		tea.SetClipboard(d.userCode),
+	var cmds []tea.Cmd
+	var infoMsg string
+	var errMsg string
+	if d.userCode == "" {
+		infoMsg = "URL copied to clipboard and opened in browser"
+		errMsg = "failed to open browser. URL is on your clipboard"
+		cmds = append(cmds, tea.SetClipboard(d.verificationURL))
+	} else {
+		infoMsg = "Code copied and URL opened"
+		errMsg = "failed to open browser. Code is on your clipboard"
+		cmds = append(cmds, tea.SetClipboard(d.userCode))
+	}
+	cmds = append(cmds,
 		func() tea.Msg {
-			if err := browser.OpenURL(d.verificationURL); err != nil {
-				return ActionOAuthErrored{fmt.Errorf("failed to open browser: %w", err)}
+			// xdg-open has return code 0 on some errors, so also check stderr which
+			// should be empty on success.
+			var stderrBuf bytes.Buffer
+			browser.Stderr = &stderrBuf
+			err := browser.OpenURL(d.verificationURL)
+			if err != nil || stderrBuf.Len() > 0 {
+				return util.ReportError(errors.New(errMsg))()
 			}
-			return nil
+			return util.ReportInfo(infoMsg)()
 		},
-		util.ReportInfo("Code copied and URL opened"),
 	)
+	return tea.Sequence(cmds...)
+}
+
+// complete is called when the OAuth flow succeeds. If onComplete is set it
+// delegates to it; otherwise it falls back to the default provider key save.
+func (m *OAuth) complete() Action {
+	if m.onComplete != nil {
+		return m.onComplete(m.oauth2Token)
+	}
+	return m.saveKeyAndContinue()
+}
+
+func (m *OAuth) cancel() Action {
+	if m.onCancel != nil {
+		return m.onCancel()
+	}
+	return ActionClose{}
 }
 
 func (m *OAuth) saveKeyAndContinue() Action {

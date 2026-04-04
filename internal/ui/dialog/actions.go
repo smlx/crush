@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/util"
+	"golang.org/x/oauth2"
 )
 
 // ActionClose is a message to close the current dialog.
@@ -111,6 +112,11 @@ type (
 		Token *oauth.Token
 	}
 
+	// ActionCompleteMCPOAuth is sent when the MCP flow completes successfully.
+	ActionCompleteMCPOAuth struct {
+		Token *oauth2.Token
+	}
+
 	// ActionOAuthErrored is sent when the device flow encounters an error.
 	ActionOAuthErrored struct {
 		Error error
@@ -170,4 +176,9 @@ func (a ActionFilePickerSelected) Cmd() tea.Cmd {
 			Content:  content,
 		}
 	}
+}
+
+// ActionCancelMCPOAuth is a message indicating that the MCP OAuth flow should be cancelled.
+type ActionCancelMCPOAuth struct {
+	Name string
 }

@@ -19,7 +19,7 @@ func NewOAuthHyper(
 	model config.SelectedModel,
 	modelType config.SelectedModelType,
 ) (*OAuth, tea.Cmd) {
-	return newOAuth(com, isOnboarding, provider, model, modelType, &OAuthHyper{})
+	return newOAuth(com, isOnboarding, provider, model, modelType, &OAuthHyper{}, nil, nil)
 }
 
 type OAuthHyper struct {
