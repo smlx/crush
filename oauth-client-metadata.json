@@ -1,0 +1,10 @@
+{
+  "client_id": "https://charm.land/crush/oauth-client-metadata.json",
+  "client_name": "crush",
+  "client_uri": "https://github.com/charmbracelet/crush/",
+  "redirect_uris": [
+    "https://localhost:49433/callback",
+    "https://localhost:52829/callback",
+    "https://localhost:54257/callback"
+  ]
+}
