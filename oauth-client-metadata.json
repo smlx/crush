@@ -1,5 +1,5 @@
 {
-  "client_id": "https://charm.land/crush/oauth-client-metadata.json",
+  "client_id": "https://raw.githubusercontent.com/smlx/crush/refs/heads/mcp-oauth2-pr-test/oauth-client-metadata.json",
   "client_name": "crush",
   "client_uri": "https://github.com/charmbracelet/crush/",
   "redirect_uris": [
