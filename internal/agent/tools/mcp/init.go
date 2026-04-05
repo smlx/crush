@@ -71,7 +71,7 @@ var (
 	oauthCallbackPorts = []int{49433, 52829, 54257}
 	// oauthClientMetadataURL defines the URL required by
 	// https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-01
-	oauthClientMetadataURL = "https://charm.land/oauth/client-metadata.json"
+	oauthClientMetadataURL = "https://charm.land/crush/oauth-client-metadata.json"
 )
 
 // State represents the current state of an MCP client
