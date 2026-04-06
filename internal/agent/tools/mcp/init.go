@@ -739,7 +739,7 @@ func newOAuthHandler(name string, store *state.MCPStore) (*auth.AuthorizationCod
 }
 
 func mcpTimeout(m config.MCPConfig) time.Duration {
-	return time.Duration(cmp.Or(m.Timeout, 15)) * time.Second
+	return time.Duration(cmp.Or(m.Timeout, 60)) * time.Second
 }
 
 func stdioCheck(old *exec.Cmd) error {
