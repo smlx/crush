@@ -743,7 +743,7 @@ func (h *crushOAuthHandler) Authorize(ctx context.Context, req *http.Request, re
 }
 
 func mcpTimeout(m config.MCPConfig) time.Duration {
-	return time.Duration(cmp.Or(m.Timeout, 15)) * time.Second
+	return time.Duration(cmp.Or(m.Timeout, 60)) * time.Second
 }
 
 func stdioCheck(old *exec.Cmd) error {
