@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -455,6 +456,17 @@ func maybeTimeoutErr(err error, timeout time.Duration) error {
 	return err
 }
 
+func mcpHeaders(m config.MCPConfig, store *state.MCPStore) map[string]string {
+	headers := maps.Clone(m.ResolvedHeaders())
+	if headers == nil {
+		headers = map[string]string{}
+	}
+	if storeHeaders, err := store.LoadHeaders(); err == nil {
+		maps.Copy(headers, storeHeaders)
+	}
+	return headers
+}
+
 func createTransport(ctx context.Context, name string, m config.MCPConfig, resolver config.VariableResolver) (mcp.Transport, error) {
 	switch m.Type {
 	case config.MCPStdio:
@@ -479,7 +491,7 @@ func createTransport(ctx context.Context, name string, m config.MCPConfig, resol
 			return nil, fmt.Errorf("mcp http config requires a non-empty 'url' field")
 		}
 		client := &http.Client{
-			Transport: &headerRoundTripper{headers: m.ResolvedHeaders()},
+			Transport: &headerRoundTripper{headers: mcpHeaders(m, store)},
 		}
 		return &mcp.StreamableClientTransport{
 			Endpoint:     m.URL,
@@ -487,11 +499,15 @@ func createTransport(ctx context.Context, name string, m config.MCPConfig, resol
 			OAuthHandler: &crushOAuthHandler{store: store, name: name, mcpURL: m.URL},
 		}, nil
 	case config.MCPSSE:
+		store, err := state.NewMCPStore(name)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't init MCP state store: %v", err)
+		}
 		if strings.TrimSpace(m.URL) == "" {
 			return nil, fmt.Errorf("mcp sse config requires a non-empty 'url' field")
 		}
 		client := &http.Client{
-			Transport: &headerRoundTripper{headers: m.ResolvedHeaders()},
+			Transport: &headerRoundTripper{headers: mcpHeaders(m, store)},
 		}
 		return &mcp.SSEClientTransport{
 			Endpoint:   m.URL,
@@ -533,7 +549,7 @@ func (f tokenSourceFunc) Token() (*oauth2.Token, error) {
 
 // TokenSource will save tokens to the MCPOAuth2Store on each refresh.
 func (h *crushOAuthHandler) TokenSource(ctx context.Context) (oauth2.TokenSource, error) {
-	st, err := h.store.Load()
+	st, err := h.store.LoadOAuth2()
 	if errors.Is(err, state.ErrNoStore) {
 		return nil, nil // no error, just no token available
 	}
@@ -544,17 +560,17 @@ func (h *crushOAuthHandler) TokenSource(ctx context.Context) (oauth2.TokenSource
 	if st.Config != nil {
 		base := st.Config.TokenSource(ctx, st.Token)
 		return tokenSourceFunc(func() (*oauth2.Token, error) {
-			tok, err := base.Token()
+			newTok, err := base.Token()
 			if err != nil {
 				return nil, err
 			}
-			if st.Token == nil || tok.AccessToken != st.Token.AccessToken || tok.RefreshToken != st.Token.RefreshToken {
-				st.Token = tok
-				if err := h.store.SaveOAuth2Token(tok); err != nil {
-					slog.Warn("Failed to save MCP OAuth2 state", "name", h.name, "error", err)
+			if st.Token == nil || newTok.AccessToken != st.Token.AccessToken || newTok.RefreshToken != st.Token.RefreshToken {
+				st.Token = newTok
+				if err := h.store.SaveOAuth2Token(newTok); err != nil {
+					slog.Warn("Failed to save MCP OAuth2 token", "name", h.name, "error", err)
 				}
 			}
-			return tok, nil
+			return newTok, nil
 		}), nil
 	}
 
@@ -579,22 +595,22 @@ func (h *crushOAuthHandler) Authorize(ctx context.Context, req *http.Request, re
 	if h.authAttempts > 3 {
 		return fmt.Errorf("authorization retry limit exceeded: potential infinite scope step-up loop detected")
 	}
-	// load existing state, if possible
-	st, err := h.store.Load()
+	// load existing config and token, if possible
+	st, err := h.store.LoadOAuth2()
 	if err != nil {
 		if err != state.ErrNoStore {
 			return fmt.Errorf("couldn't load oauth2 state: %v", err)
 		}
 		st = &state.MCPOAuth2{}
 	}
+
 	// force token refresh to return early and avoid interactive flow if possible
 	if st.Config != nil && st.Token != nil && st.Token.RefreshToken != "" {
 		st.Token.Expiry = time.Now().Add(-time.Hour)
-		ts := st.Config.TokenSource(ctx, st.Token)
-		tok, err := ts.Token()
-		if err == nil && tok.Valid() {
-			if err := h.store.SaveOAuth2Token(tok); err != nil {
-				slog.Warn("Failed to save MCP OAuth2 state", "name", h.name, "error", err)
+		newTok, err := st.Config.TokenSource(ctx, st.Token).Token()
+		if err == nil && newTok.Valid() {
+			if err := h.store.SaveOAuth2Token(newTok); err != nil {
+				slog.Warn("Failed to save MCP OAuth2 token", "name", h.name, "error", err)
 			}
 			return nil
 		}
@@ -628,7 +644,7 @@ func (h *crushOAuthHandler) Authorize(ctx context.Context, req *http.Request, re
 	redirectURI := fmt.Sprintf("http://localhost:%d/callback",
 		ln.Addr().(*net.TCPAddr).Port)
 	// configure the mcp go-sdk authz code handler
-	cfg := &auth.AuthorizationCodeHandlerConfig{
+	authCfg := &auth.AuthorizationCodeHandlerConfig{
 		ClientIDMetadataDocumentConfig: &auth.ClientIDMetadataDocumentConfig{
 			URL: oauthClientMetadataURL,
 		},
@@ -714,7 +730,7 @@ func (h *crushOAuthHandler) Authorize(ctx context.Context, req *http.Request, re
 	}
 
 	// run the auth code flow
-	sdkHandler, err := auth.NewAuthorizationCodeHandler(cfg)
+	sdkHandler, err := auth.NewAuthorizationCodeHandler(authCfg)
 	if err != nil {
 		return fmt.Errorf("couldn't create authz code handler: %v", err)
 	}
@@ -725,12 +741,11 @@ func (h *crushOAuthHandler) Authorize(ctx context.Context, req *http.Request, re
 	if err != nil {
 		return fmt.Errorf("couldn't get token source: %v", err)
 	}
-	tok, err := ts.Token()
+	newTok, err := ts.Token()
 	if err != nil {
 		return fmt.Errorf("couldn't get token: %v", err)
 	}
-	st.Token = tok
-	if err := h.store.SaveOAuth2Token(tok); err != nil {
+	if err := h.store.SaveOAuth2Token(newTok); err != nil {
 		return fmt.Errorf("couldn't store token: %v", err)
 	}
 

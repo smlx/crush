@@ -22,6 +22,11 @@ type MCPOAuth2 struct {
 	Token  *oauth2.Token  `json:"token,omitempty"`
 }
 
+type mcpState struct {
+	MCPOAuth2
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
 func NewMCPStore(name string) (*MCPStore, error) {
 	stateDir, ok := os.LookupEnv("XDG_STATE_HOME")
 	if !ok {
@@ -36,7 +41,7 @@ func NewMCPStore(name string) (*MCPStore, error) {
 		return nil, err
 	}
 	return &MCPStore{
-		path: filepath.Join(path, name+".oauth2.json"),
+		path: filepath.Join(path, name+".json"),
 	}, nil
 }
 
@@ -49,7 +54,7 @@ func (s *MCPStore) SaveOAuth2Config(cfg *oauth2.Config) error {
 		return err
 	}
 	if state == nil {
-		state = &MCPOAuth2{}
+		state = &mcpState{}
 	}
 	state.Config = cfg
 
@@ -69,7 +74,7 @@ func (s *MCPStore) SaveOAuth2Token(tok *oauth2.Token) error {
 		return err
 	}
 	if state == nil {
-		state = &MCPOAuth2{}
+		state = &mcpState{}
 	}
 	state.Token = tok
 
@@ -80,7 +85,27 @@ func (s *MCPStore) SaveOAuth2Token(tok *oauth2.Token) error {
 	return os.WriteFile(s.path, data, 0o600)
 }
 
-func (s *MCPStore) loadNoLock() (*MCPOAuth2, error) {
+func (s *MCPStore) SaveHeaders(headers map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, err := s.loadNoLock()
+	if err != nil && err != ErrNoStore {
+		return err
+	}
+	if state == nil {
+		state = &mcpState{}
+	}
+	state.Headers = headers
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.path, data, 0o600)
+}
+
+func (s *MCPStore) loadNoLock() (*mcpState, error) {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -89,7 +114,7 @@ func (s *MCPStore) loadNoLock() (*MCPOAuth2, error) {
 		return nil, err
 	}
 
-	var state MCPOAuth2
+	var state mcpState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, err
 	}
@@ -97,9 +122,24 @@ func (s *MCPStore) loadNoLock() (*MCPOAuth2, error) {
 	return &state, nil
 }
 
-func (s *MCPStore) Load() (*MCPOAuth2, error) {
+func (s *MCPStore) LoadOAuth2() (*MCPOAuth2, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.loadNoLock()
+	state, err := s.loadNoLock()
+	if err != nil {
+		return nil, err
+	}
+	return &state.MCPOAuth2, nil
+}
+
+func (s *MCPStore) LoadHeaders() (map[string]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, err := s.loadNoLock()
+	if err != nil {
+		return nil, err
+	}
+	return state.Headers, nil
 }
