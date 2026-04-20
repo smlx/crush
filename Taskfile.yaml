@@ -49,6 +49,7 @@ tasks:
     sources:
       - ./**/*.go
       - go.mod
+      - go.work
       - internal/agent/**/*.md
       - internal/agent/**/*.md.tpl
       - internal/agent/hyper/provider.json
