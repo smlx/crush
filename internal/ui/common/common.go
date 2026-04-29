@@ -113,9 +113,14 @@ func CopyToClipboardWithCallback(text, successMessage string, callback tea.Cmd) 
 		tea.SetClipboard(text),
 		func() tea.Msg {
 			clipboard.WriteText(text)
-			return nil
+			// report an error if the callback returns one
+			if callback != nil {
+				if msg := callback(); msg != nil {
+					return msg
+				}
+			}
+			// otherwise report success
+			return util.ReportInfo(successMessage)()
 		},
-		callback,
-		util.ReportInfo(successMessage),
 	)
 }
